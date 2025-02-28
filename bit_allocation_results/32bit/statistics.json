@@ -1,0 +1,12 @@
+{
+    "total_bits": 711.0,
+    "max_bits": 32.0,
+    "min_bits": 5.0,
+    "mean_bits": 25.392857142857142,
+    "active_bands": 28,
+    "bit_depth": 32,
+    "dynamic_range": 192,
+    "theoretical_snr": 194.39999999999998,
+    "frame_size": 1024,
+    "verification": true
+}

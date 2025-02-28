@@ -1,0 +1,2 @@
+duration,num_samples,sample_rate,max_amplitude,min_amplitude,mean_amplitude,rms_amplitude,total_energy,zero_crossings_rate
+7.975,191400,24000,1.0,-0.6844456,-8.353946e-06,0.12773599,3122.9744,0.13938349007314524

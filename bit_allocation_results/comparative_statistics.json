@@ -1,0 +1,32 @@
+{
+    "32bit": {
+        "total_bits": 711.0,
+        "max_bits": 32.0,
+        "min_bits": 5.0,
+        "mean_bits": 25.392857142857142,
+        "active_bands": 28,
+        "bit_depth": 32,
+        "dynamic_range": 192,
+        "theoretical_snr": 194.39999999999998
+    },
+    "24bit": {
+        "total_bits": 450.0,
+        "max_bits": 24.0,
+        "min_bits": 4.0,
+        "mean_bits": 16.071428571428573,
+        "active_bands": 28,
+        "bit_depth": 24,
+        "dynamic_range": 144,
+        "theoretical_snr": 146.23999999999998
+    },
+    "16bit": {
+        "total_bits": 218.0,
+        "max_bits": 16.0,
+        "min_bits": 2.0,
+        "mean_bits": 7.785714285714286,
+        "active_bands": 28,
+        "bit_depth": 16,
+        "dynamic_range": 96,
+        "theoretical_snr": 98.08
+    }
+}
