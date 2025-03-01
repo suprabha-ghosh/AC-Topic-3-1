@@ -1,303 +1,215 @@
-# quantizer.py
 import numpy as np
-from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
-import logging
+import soundfile as sf
 import os
 import json
 import matplotlib.pyplot as plt
+import scipy.signal
+from scipy import stats
+import pandas as pd
 
-@dataclass
-class QuantizationInfo:
-    step_sizes: np.ndarray
-    scale_factors: np.ndarray
-    snr_db: np.ndarray
-    noise_energy: np.ndarray
-    bit_allocation: np.ndarray
-
-class NumpyEncoder(json.JSONEncoder):
-    """Custom encoder for numpy data types"""
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super(NumpyEncoder, self).default(obj)
-
-class Quantizer:
-    def __init__(self, target_bitrate: int):
-        """Initialize quantizer with target bit rate"""
-        self.target_bitrate = target_bitrate
-        self.logger = logging.getLogger(__name__)
-        self._validate_bitrate()
-        
-    def _validate_bitrate(self):
-        """Validate the target bitrate"""
-        valid_bitrates = [16, 24, 32]
-        if self.target_bitrate not in valid_bitrates:
-            raise ValueError(f"Target bitrate must be one of {valid_bitrates}")
-        
-    def compute_step_sizes(self, 
-                         subband_signals: np.ndarray, 
-                         bit_allocation: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute quantization step sizes for each subband"""
-        num_subbands = len(bit_allocation)
-        step_sizes = np.zeros(num_subbands)
-        scale_factors = np.zeros(num_subbands)
-        
-        # Compute maximum amplitude and scale factors
-        max_amplitudes = np.max(np.abs(subband_signals), axis=1)
-        active_bands = (bit_allocation > 0) & (max_amplitudes > 0)
-        
-        # Vectorized computation for active bands
-        scale_factors[active_bands] = max_amplitudes[active_bands]
-        num_levels = 2 ** bit_allocation[active_bands]
-        
-        # Compute step sizes based on bit depth
-        if self.target_bitrate == 32:
-            step_sizes[active_bands] = 2.0 / (num_levels * 1.5)
-        elif self.target_bitrate == 24:
-            step_sizes[active_bands] = 2.0 / num_levels
-        else:  # 16-bit
-            step_sizes[active_bands] = 2.0 / (num_levels * 0.9)
-            
-        return step_sizes, scale_factors
-
-    def apply_quantization(self, 
-                         subband_signals: np.ndarray,
-                         bit_allocation: np.ndarray,
-                         step_sizes: np.ndarray,
-                         scale_factors: np.ndarray) -> np.ndarray:
-        """Apply quantization to normalized subband signals"""
-        # Create mask for active bands
-        active_bands = (bit_allocation > 0) & (scale_factors > 0)
-        
-        # Initialize output array
-        quantized_signals = np.zeros_like(subband_signals)
-        
-        if not np.any(active_bands):
-            self.logger.warning("No active bands found for quantization")
-            return quantized_signals
-        
-        # Process active bands
-        for i in np.where(active_bands)[0]:
-            # Normalize and quantize
-            normalized = subband_signals[i] / scale_factors[i]
-            quantized = np.round(normalized / step_sizes[i])
-            
-            # Clip to valid range
-            max_value = (2 ** (bit_allocation[i] - 1)) - 1
-            quantized = np.clip(quantized, -max_value, max_value)
-            
-            # Scale back
-            quantized_signals[i] = quantized * step_sizes[i] * scale_factors[i]
-        
-        return quantized_signals
-
-    def quantize_subbands(self, 
-                         subband_signals: np.ndarray,
-                         bit_allocation: np.ndarray) -> Tuple[np.ndarray, QuantizationInfo]:
-        """Main quantization function"""
-        try:
-            # Compute step sizes and scale factors
-            step_sizes, scale_factors = self.compute_step_sizes(subband_signals, bit_allocation)
-            
-            # Apply quantization
-            quantized_signals = self.apply_quantization(
-                subband_signals, bit_allocation, step_sizes, scale_factors
-            )
-            
-            # Calculate noise and SNR
-            noise = subband_signals - quantized_signals
-            noise_energy = np.mean(noise ** 2, axis=1)
-            signal_energy = np.mean(subband_signals ** 2, axis=1)
-            snr = 10 * np.log10(signal_energy / (noise_energy + 1e-10))
-            
-            # Create quantization info
-            quant_info = QuantizationInfo(
-                step_sizes=step_sizes,
-                scale_factors=scale_factors,
-                snr_db=snr,
-                noise_energy=noise_energy,
-                bit_allocation=bit_allocation
-            )
-            
-            return quantized_signals, quant_info
-            
-        except Exception as e:
-            self.logger.error(f"Quantization failed: {str(e)}")
-            raise
-
-    def analyze_performance(self, 
-                          original: np.ndarray, 
-                          quantized: np.ndarray, 
-                          quant_info: QuantizationInfo) -> Dict:
-        """Analyze quantization performance"""
-        error = original - quantized
-        mse = np.mean(error ** 2)
-        max_error = np.max(np.abs(error))
-        
-        subband_mse = np.mean(error ** 2, axis=1)
-        subband_snr = 10 * np.log10(
-            np.mean(original ** 2, axis=1) / 
-            (np.mean(error ** 2, axis=1) + 1e-10)
-        )
-        
-        return {
-            'overall': {
-                'mse': float(mse),
-                'max_error': float(max_error),
-                'avg_snr': float(np.mean(subband_snr))
-            },
-            'per_subband': {
-                'mse': subband_mse.tolist(),
-                'snr': subband_snr.tolist(),
-                'step_sizes': quant_info.step_sizes.tolist(),
-                'scale_factors': quant_info.scale_factors.tolist()
-            }
-        }
-
-    def save_results(self, 
-                    original_signals: np.ndarray,
-                    quantized_signals: np.ndarray,
-                    quant_info: QuantizationInfo,
-                    output_dir: str = "quantization_results"):
-        """Save quantization results and analysis"""
-        # Create output directory
-        bit_depth_dir = os.path.join(output_dir, f"{self.target_bitrate}bit")
-        os.makedirs(bit_depth_dir, exist_ok=True)
-
-        # 1. Save quantization parameters
-        params = {
-            'target_bitrate': self.target_bitrate,
-            'num_subbands': len(quant_info.bit_allocation),
-            'bit_allocation': quant_info.bit_allocation,
-            'step_sizes': quant_info.step_sizes,
-            'scale_factors': quant_info.scale_factors
-        }
-        
-        with open(os.path.join(bit_depth_dir, 'quantization_params.json'), 'w') as f:
-            json.dump(params, f, cls=NumpyEncoder, indent=4)
-
-        # 2. Save performance analysis
-        analysis = self.analyze_performance(original_signals, quantized_signals, quant_info)
-        
-        with open(os.path.join(bit_depth_dir, 'performance_analysis.json'), 'w') as f:
-            json.dump(analysis, f, cls=NumpyEncoder, indent=4)
-
-        # 3. Generate and save plots
-        self._save_analysis_plots(original_signals, quantized_signals, quant_info, bit_depth_dir)
-
-        # 4. Save numerical data
-        np.save(os.path.join(bit_depth_dir, 'original_signals.npy'), original_signals)
-        np.save(os.path.join(bit_depth_dir, 'quantized_signals.npy'), quantized_signals)
-
-        return bit_depth_dir
-
-    def _save_analysis_plots(self, 
-                           original_signals: np.ndarray,
-                           quantized_signals: np.ndarray,
-                           quant_info: QuantizationInfo,
-                           output_dir: str):
-        """Generate and save analysis plots"""
-        
-        # 1. Signal Comparison Plot
-        plt.figure(figsize=(12, 6))
-        for i in range(min(3, len(original_signals))):  # Plot first 3 subbands
-            plt.subplot(3, 1, i+1)
-            plt.plot(original_signals[i, :100], label='Original', alpha=0.7)
-            plt.plot(quantized_signals[i, :100], label='Quantized', alpha=0.7)
-            plt.title(f'Subband {i} Signal Comparison')
-            plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'signal_comparison.png'))
-        plt.close()
-
-        # 2. SNR and Bit Allocation
-        plt.figure(figsize=(10, 6))
-        plt.plot(quant_info.snr_db, label='SNR (dB)')
-        plt.plot(quant_info.bit_allocation, label='Bit Allocation')
-        plt.grid(True)
-        plt.xlabel('Subband Index')
-        plt.ylabel('dB / Bits')
-        plt.title('SNR and Bit Allocation')
-        plt.legend()
-        plt.savefig(os.path.join(output_dir, 'snr_bits.png'))
-        plt.close()
-
-        # 3. Quantization Error
-        error = original_signals - quantized_signals
-        plt.figure(figsize=(10, 6))
-        plt.plot(np.mean(error**2, axis=1))
-        plt.grid(True)
-        plt.xlabel('Subband Index')
-        plt.ylabel('Mean Squared Error')
-        plt.title('Quantization Error by Subband')
-        plt.savefig(os.path.join(output_dir, 'quantization_error.png'))
-        plt.close()
-
-def test_quantizer():
-    """Unit test function for both 16-bit and 24-bit quantization"""
-    # Test setup
-    frame_size = 1024
-    num_subbands = 32
+def uniform_quantize(data, bit_depth):
+    """
+    Perform uniform quantization to reduce bit depth.
+    :param data: Input signal (array)
+    :param bit_depth: Target bit depth (e.g., 24 or 16 bits)
+    :return: Quantized signal, step size
+    """
+    # Calculate the number of possible levels for the target bit depth
+    levels = 2**bit_depth
     
-    # Create test data
-    subband_signals = np.random.randn(num_subbands, frame_size)
-    bit_allocation = np.random.randint(0, 8, num_subbands)
-    
-    # Test both 16-bit and 24-bit quantization
-    for target_bitrate in [16, 24]:
-        print(f"\nTesting {target_bitrate}-bit quantization:")
+    # Scale the input data to the full range [-1, 1]
+    max_abs = np.max(np.abs(data))
+    if max_abs > 0:
+        data_scaled = data / max_abs
+    else:
+        data_scaled = data
         
-        try:
-            # Initialize quantizer
-            quantizer = Quantizer(target_bitrate)
-            
-            # Test quantization
-            quantized_signals, quant_info = quantizer.quantize_subbands(
-                subband_signals, bit_allocation
-            )
-            
-            # Save results
-            output_dir = quantizer.save_results(
-                subband_signals,
-                quantized_signals,
-                quant_info
-            )
-            
-            print(f"Results saved to: {output_dir}")
-            
-            # Basic assertions
-            assert quantized_signals.shape == subband_signals.shape, "Shape mismatch"
-            assert np.all(np.isfinite(quantized_signals)), "Non-finite values found"
-            assert len(quant_info.step_sizes) == num_subbands, "Step sizes length mismatch"
-            
-            # Compare SNR between bit depths
-            mean_snr = np.mean(quant_info.snr_db)
-            print(f"Mean SNR: {mean_snr:.2f} dB")
-            
-            # Theoretical SNR improvement (6.02 dB per bit)
-            if target_bitrate == 24:
-                theoretical_improvement = (24 - 16) * 6.02
-                print(f"Theoretical SNR improvement over 16-bit: {theoretical_improvement:.2f} dB")
-            
-            print(f"{target_bitrate}-bit quantization tests passed successfully!")
-            
-        except Exception as e:
-            print(f"Error during {target_bitrate}-bit testing: {str(e)}")
-            return False
+    # Calculate step size
+    step_size = 2.0 / levels
     
-    return True
+    # Quantize the signal
+    quantized = np.round(data_scaled * (levels/2)) * step_size
+    
+    # Clip to ensure values stay within valid range
+    quantized = np.clip(quantized, -1.0, 1.0 - step_size)
+    
+    return quantized, step_size
+
+def compute_snr(original, quantized):
+    """
+    Compute Signal-to-Noise Ratio (SNR)
+    """
+    # Ensure the signals are aligned in amplitude
+    scale_factor = np.max(np.abs(original)) / np.max(np.abs(quantized))
+    quantized_scaled = quantized * scale_factor
+    
+    noise = original - quantized_scaled
+    signal_power = np.mean(original ** 2)
+    noise_power = np.mean(noise ** 2)
+    snr = 10 * np.log10(signal_power / (noise_power + 1e-10))
+    return snr
+
+def analyze_signal(audio_signal, sample_rate):
+    """
+    Perform comprehensive signal analysis
+    """
+    analysis = {}
+    
+    # Time domain analysis
+    analysis['peak'] = float(np.max(np.abs(audio_signal)))
+    analysis['rms'] = float(np.sqrt(np.mean(audio_signal**2)))
+    analysis['crest_factor'] = float(analysis['peak'] / analysis['rms'])
+    analysis['dynamic_range'] = float(20 * np.log10(analysis['peak'] / 
+                                                   (np.min(np.abs(audio_signal[audio_signal != 0])) + 1e-10)))
+    
+    # Statistical analysis
+    analysis['mean'] = float(np.mean(audio_signal))
+    analysis['std'] = float(np.std(audio_signal))
+    analysis['skewness'] = float(stats.skew(audio_signal))
+    analysis['kurtosis'] = float(stats.kurtosis(audio_signal))
+    
+    # Frequency domain analysis
+    frequencies, power_spectrum = scipy.signal.welch(audio_signal, sample_rate, nperseg=1024)
+    analysis['dominant_frequency'] = float(frequencies[np.argmax(power_spectrum)])
+    analysis['spectral_centroid'] = float(np.sum(frequencies * power_spectrum) / np.sum(power_spectrum))
+    
+    return analysis
+
+def plot_analysis(original, quantized, bit_depth, sample_rate, output_dir):
+    """
+    Generate comprehensive analysis plots
+    """
+    plt.figure(figsize=(15, 10))
+    
+    # Time domain comparison - Zoomed in to see quantization levels
+    plt.subplot(3, 2, 1)
+    start_sample = 1000
+    num_samples = 100
+    plt.plot(range(start_sample, start_sample + num_samples), 
+            original[start_sample:start_sample + num_samples], 
+            label="Original", alpha=0.7)
+    plt.plot(range(start_sample, start_sample + num_samples), 
+            quantized[start_sample:start_sample + num_samples], 
+            label=f"Quantized {bit_depth}-bit", linestyle='dashed', alpha=0.7)
+    plt.legend()
+    plt.title("Time Domain Comparison (Zoomed)")
+    plt.grid(True)
+    
+    # Quantization error
+    plt.subplot(3, 2, 2)
+    error = original - quantized
+    plt.plot(range(start_sample, start_sample + num_samples), 
+            error[start_sample:start_sample + num_samples])
+    plt.title("Quantization Error (Zoomed)")
+    plt.grid(True)
+    
+    # Frequency spectrum
+    plt.subplot(3, 2, 3)
+    f_orig, pxx_orig = scipy.signal.welch(original, sample_rate)
+    f_quant, pxx_quant = scipy.signal.welch(quantized, sample_rate)
+    plt.semilogy(f_orig, pxx_orig, label='Original')
+    plt.semilogy(f_quant, pxx_quant, label=f'Quantized {bit_depth}-bit')
+    plt.legend()
+    plt.title("Power Spectral Density")
+    plt.grid(True)
+    
+    # Error distribution
+    plt.subplot(3, 2, 4)
+    plt.hist(error, bins=100, density=True)
+    plt.title("Error Distribution")
+    plt.grid(True)
+    
+    # Spectrogram comparison
+    plt.subplot(3, 2, 5)
+    f, t, Sxx = scipy.signal.spectrogram(original, sample_rate)
+    plt.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-10))
+    plt.title("Original Spectrogram")
+    plt.ylabel('Frequency [Hz]')
+    
+    plt.subplot(3, 2, 6)
+    f, t, Sxx = scipy.signal.spectrogram(quantized, sample_rate)
+    plt.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-10))
+    plt.title(f"Quantized Spectrogram ({bit_depth}-bit)")
+    plt.ylabel('Frequency [Hz]')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"signal_analysis_{bit_depth}bit.png"))
+    plt.close()
+
+def save_results(output_dir, bit_depth, original, quantized, step_size, snr, sample_rate):
+    """
+    Save results and analysis
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Perform signal analysis
+    orig_analysis = analyze_signal(original, sample_rate)
+    quant_analysis = analyze_signal(quantized, sample_rate)
+    
+    # Create analysis report
+    analysis = {
+        "bit_depth": int(bit_depth),
+        "step_size": float(step_size),
+        "snr": float(snr),
+        "original": orig_analysis,
+        "quantized": quant_analysis
+    }
+    
+    # Save analysis to CSV
+    df = pd.DataFrame({
+        'Metric': list(orig_analysis.keys()),
+        'Original': list(orig_analysis.values()),
+        f'Quantized_{bit_depth}bit': list(quant_analysis.values())
+    })
+    df.to_csv(os.path.join(output_dir, f"analysis_{bit_depth}bit.csv"), index=False)
+    
+    # Save detailed analysis plots
+    plot_analysis(original, quantized, bit_depth, sample_rate, output_dir)
+    
+    # Save raw signals
+    np.save(os.path.join(output_dir, "original_signals.npy"), original)
+    np.save(os.path.join(output_dir, "quantized_signals.npy"), quantized)
+    
+    # Save analysis report
+    with open(os.path.join(output_dir, "analysis_report.json"), "w") as f:
+        json.dump(analysis, f, indent=4)
+
+def quantize_audio(input_file):
+    """
+    Load 32-bit WAV, apply quantization (24-bit & 16-bit), save results.
+    """
+    # Load input audio
+    data, sample_rate = sf.read(input_file, dtype='float32')
+    
+    # Convert to mono if stereo
+    if len(data.shape) > 1:
+        data = data.mean(axis=1)
+    
+    print("Processing audio file...")
+    print(f"Sample rate: {sample_rate} Hz")
+    print(f"Duration: {len(data)/sample_rate:.2f} seconds")
+    
+    for bit_depth in [24, 16]:
+        print(f"\nProcessing {bit_depth}-bit quantization...")
+        output_dir = f"quantization_results/{bit_depth}bit"
+        
+        # Apply uniform quantization
+        quantized_data, step_size = uniform_quantize(data, bit_depth)
+        
+        # Compute SNR
+        snr = compute_snr(data, quantized_data)
+        print(f"SNR: {snr:.2f} dB")
+        print(f"Step size: {step_size:.10f}")
+        
+        # Save results and analysis
+        save_results(output_dir, bit_depth, data, quantized_data, step_size, snr, sample_rate)
+        
+        # Save quantized audio
+        sf.write(os.path.join(output_dir, f"output_{bit_depth}bit.wav"), 
+                quantized_data, sample_rate, subtype=f'PCM_{bit_depth}')
+    
+    print("\nQuantization and analysis completed. Results saved.")
 
 if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Run tests
-    test_quantizer()
+    input_wav = "input_audio/input_audio.wav"
+    quantize_audio(input_wav)

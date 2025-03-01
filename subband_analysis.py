@@ -1,259 +1,197 @@
 import numpy as np
-from scipy.fftpack import fft, ifft
-from scipy.signal import windows
+from scipy import signal
+import soundfile as sf
 import matplotlib.pyplot as plt
 import os
+import json
+from scipy.fftpack import dct
 
 class SubbandAnalysis:
-    def __init__(self, num_subbands, frame_size, sample_rate):
-        """
-        Initialize subband analysis
-        
-        Args:
-            num_subbands (int): Number of subbands (64, 128, 512, 1024, or 2048)
-            frame_size (int): Size of each frame
-            sample_rate (int): Audio sample rate
-        """
-        self.valid_subbands = [64, 128, 512, 1024, 2048]
-        if num_subbands not in self.valid_subbands:
-            raise ValueError(f"num_subbands must be one of {self.valid_subbands}")
-            
-        self.num_subbands = num_subbands
-        self.frame_size = frame_size
-        self.sample_rate = sample_rate
-        self.freq_bins = np.fft.fftfreq(frame_size, 1/sample_rate)
-        self.filters = self._create_filterbank()
+    def __init__(self, num_bands=32):
+        self.num_bands = num_bands
+        self.prototype_filter = self.design_prototype_filter()
 
-    def _create_filterbank(self):
+    def design_prototype_filter(self):
         """
-        Create subband analysis filterbank with mel-scaled frequency bands
-        
-        Returns:
-            np.ndarray: Filter bank coefficients
+        Design prototype filter for subband analysis
         """
-        filters = np.zeros((self.num_subbands, self.frame_size))
+        # Length of prototype filter (typically 512 for 32 bands)
+        M = 512
         
-        # Calculate mel-scaled frequency edges
-        mel_max = 2595 * np.log10(1 + (self.sample_rate/2)/700)
-        mel_points = np.linspace(0, mel_max, self.num_subbands + 1)
-        freq_edges = 700 * (10**(mel_points/2595) - 1)
+        # Design prototype lowpass filter
+        cutoff = 1.0 / (2.0 * self.num_bands)
+        prototype = signal.firwin(M, cutoff)
         
-        # Normalize frequencies
-        norm_freq_edges = freq_edges / (self.sample_rate/2)
-        freq = np.linspace(0, 1, self.frame_size)
-        
-        for i in range(self.num_subbands):
-            freq_low = norm_freq_edges[i]
-            freq_high = norm_freq_edges[i+1]
-            
-            # Create filter response with transitions
-            transition_width = 0.1 * (freq_high - freq_low)
-            response = np.zeros(self.frame_size)
-            
-            # Define regions
-            lower_transition = np.where(
-                (freq >= freq_low - transition_width) & (freq < freq_low)
-            )[0]
-            passband = np.where(
-                (freq >= freq_low) & (freq < freq_high)
-            )[0]
-            upper_transition = np.where(
-                (freq >= freq_high) & (freq < freq_high + transition_width)
-            )[0]
-            
-            # Set filter response
-            response[passband] = 1.0
-            if len(lower_transition) > 0:
-                response[lower_transition] = 0.5 * (1 + np.cos(
-                    np.pi * (freq_low - freq[lower_transition]) / transition_width
-                ))
-            if len(upper_transition) > 0:
-                response[upper_transition] = 0.5 * (1 + np.cos(
-                    np.pi * (freq[upper_transition] - freq_high) / transition_width
-                ))
-            
-            response *= windows.hann(self.frame_size)
-            filters[i] = response
-            
-        # Normalize filters
-        filters /= np.max(np.abs(filters), axis=1)[:, np.newaxis]
-        
-        return filters
+        return prototype
 
-    def analyze_frame(self, frame):
+    def analyze_subbands(self, audio_data, sample_rate):
         """
-        Analyze a single frame and prepare data for bit allocation
-        
-        Args:
-            frame (np.ndarray): Input audio frame
-            
-        Returns:
-            dict: Analysis results including subband signals and energies
+        Perform subband analysis of audio signal
         """
-        if len(frame) != self.frame_size:
-            raise ValueError(f"Frame size must be {self.frame_size}")
+        # Initialize subband signals
+        subbands = np.zeros((self.num_bands, len(audio_data)))
+        
+        # Analysis filterbank
+        for k in range(self.num_bands):
+            # Modulate prototype filter for each subband
+            band_filter = self.prototype_filter * np.cos(
+                np.pi/(2*self.num_bands) * (2*k + 1) * 
+                np.arange(len(self.prototype_filter))
+            )
             
-        # Normalize frame
-        frame = frame / (np.max(np.abs(frame)) + 1e-10)
+            # Filter the signal
+            subbands[k] = signal.lfilter(band_filter, 1.0, audio_data)
         
-        # Compute spectrum
-        spectrum = fft(frame)
-        subband_signals = np.zeros((self.num_subbands, self.frame_size), dtype=complex)
-        subband_energies = np.zeros(self.num_subbands)
-        
-        # Analyze each subband
-        for i in range(self.num_subbands):
-            # Apply filter
-            subband_signals[i] = spectrum * self.filters[i]
-            
-            # Calculate energy
-            subband_energies[i] = np.sum(np.abs(subband_signals[i])**2)
-        
-        # Calculate additional statistics for bit allocation
-        energy_variance = np.var(subband_energies)
-        peak_frequencies = np.array([
-            np.abs(self.freq_bins[np.argmax(np.abs(signal))])
-            for signal in subband_signals
-        ])
-        
-        return {
-            'subband_signals': subband_signals,
-            'subband_energies': subband_energies,
-            'energy_variance': energy_variance,
-            'peak_frequencies': peak_frequencies,
-            'frame': frame
-        }
+        return subbands
 
-    def synthesize_frame(self, subband_signals, bits_per_subband=None):
+    def compute_subband_energies(self, subbands):
         """
-        Reconstruct signal from subbands with optional quantization
-        
-        Args:
-            subband_signals (np.ndarray): Subband signals
-            bits_per_subband (np.ndarray, optional): Bits allocated per subband
-            
-        Returns:
-            np.ndarray: Reconstructed signal
+        Compute energy in each subband
         """
-        if bits_per_subband is not None:
-            # Apply quantization based on bit allocation
-            quantized_signals = np.zeros_like(subband_signals)
-            for i in range(self.num_subbands):
-                if bits_per_subband[i] > 0:
-                    # Simple uniform quantization
-                    max_val = np.max(np.abs(subband_signals[i]))
-                    levels = 2**bits_per_subband[i]
-                    step = (2 * max_val) / levels
-                    quantized = np.round(subband_signals[i] / step) * step
-                    quantized_signals[i] = quantized
-            subband_signals = quantized_signals
-            
-        reconstructed = np.sum(subband_signals, axis=0)
-        return np.real(ifft(reconstructed))
+        return np.mean(subbands**2, axis=1)
 
-    def plot_analysis(self, analysis_results, bits_per_subband=None, output_dir="subband_analysis"):
+    def plot_subband_spectrum(self, subbands, sample_rate, title, output_file=None):
         """
-        Plot analysis results
-        
-        Args:
-            analysis_results (dict): Results from analyze_frame
-            bits_per_subband (np.ndarray, optional): Bit allocation per subband
-            output_dir (str): Output directory for plots
+        Plot spectrum of subband decomposition
         """
-        os.makedirs(output_dir, exist_ok=True)
+        plt.figure(figsize=(12, 6))
         
-        # Reconstruct signal
-        reconstructed = self.synthesize_frame(
-            analysis_results['subband_signals'],
-            bits_per_subband
-        )
+        # Compute and plot spectrum for each subband
+        frequencies = np.fft.rfftfreq(subbands.shape[1], 1/sample_rate)
+        for i in range(self.num_bands):
+            spectrum = np.abs(np.fft.rfft(subbands[i]))
+            plt.semilogy(frequencies, spectrum + 1e-10, alpha=0.5, 
+                        label=f'Band {i}' if i % 4 == 0 else "")
         
-        plt.figure(figsize=(15, 10))
-        
-        # 1. Original vs Reconstructed Signal
-        plt.subplot(2, 2, 1)
-        plt.plot(analysis_results['frame'], label='Original', alpha=0.7)
-        plt.plot(reconstructed, label='Reconstructed', alpha=0.7)
-        plt.grid(True)
-        plt.xlabel('Sample')
-        plt.ylabel('Amplitude')
-        plt.title('Signal Reconstruction')
-        plt.legend()
-        
-        # 2. Filterbank Response
-        plt.subplot(2, 2, 2)
-        for i in range(min(5, self.num_subbands)):  # Plot first 5 filters
-            plt.plot(self.freq_bins[:len(self.freq_bins)//2], 
-                    self.filters[i][:len(self.freq_bins)//2],
-                    alpha=0.7,
-                    label=f'Band {i+1}')
         plt.grid(True)
         plt.xlabel('Frequency (Hz)')
         plt.ylabel('Magnitude')
-        plt.title('Filterbank Frequency Response')
+        plt.title(f'Subband Spectrum - {title}')
         plt.legend()
         
-        # 3. Subband Energies
-        plt.subplot(2, 2, 3)
-        energies_db = 10 * np.log10(analysis_results['subband_energies'] + 1e-10)
-        plt.plot(energies_db, alpha=0.7)
-        plt.grid(True)
-        plt.xlabel('Subband')
-        plt.ylabel('Energy (dB)')
-        plt.title('Subband Energy Distribution')
-        
-        # 4. Bit Allocation (if provided)
-        plt.subplot(2, 2, 4)
-        if bits_per_subband is not None:
-            plt.plot(bits_per_subband, alpha=0.7)
-            plt.grid(True)
-            plt.xlabel('Subband')
-            plt.ylabel('Allocated Bits')
-            plt.title('Bit Allocation')
+        if output_file:
+            plt.savefig(output_file)
+            plt.close()
         else:
-            plt.plot(analysis_results['peak_frequencies'], alpha=0.7)
-            plt.grid(True)
-            plt.xlabel('Subband')
-            plt.ylabel('Frequency (Hz)')
-            plt.title('Peak Frequencies')
-        
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/subband_analysis_{self.num_subbands}.png", 
-                   dpi=300, bbox_inches='tight')
-        plt.close()
+            plt.show()
 
-def main():
-    try:
-        # Example usage
-        frame_size = 2048
-        sample_rate = 44100
+    def plot_subband_energies(self, energies, title, output_file=None):
+        """
+        Plot energy distribution across subbands
+        """
+        plt.figure(figsize=(10, 5))
+        plt.bar(range(self.num_bands), 10 * np.log10(energies + 1e-10))
+        plt.grid(True)
+        plt.xlabel('Subband Index')
+        plt.ylabel('Energy (dB)')
+        plt.title(f'Subband Energy Distribution - {title}')
         
-        # Create test signal
-        t = np.linspace(0, 1, frame_size)
-        test_signal = (np.sin(2 * np.pi * 440 * t) + 
-                      np.sin(2 * np.pi * 1000 * t) +
-                      np.sin(2 * np.pi * 4000 * t))
-        
-        # Test different subband configurations
-        for num_subbands in [64, 128, 512, 1024, 2048]:
-            print(f"\nAnalyzing with {num_subbands} subbands...")
-            
-            # Initialize analyzer
-            analyzer = SubbandAnalysis(num_subbands, frame_size, sample_rate)
-            
-            # Analyze frame
-            results = analyzer.analyze_frame(test_signal)
-            
-            # Plot results
-            analyzer.plot_analysis(results)
-            
-            print(f"Analysis completed for {num_subbands} subbands")
-            print(f"Energy variance: {results['energy_variance']:.2e}")
-            print(f"Number of non-zero subbands: "
-                  f"{np.sum(results['subband_energies'] > 1e-10)}")
-            
-    except Exception as e:
-        print(f"Error: {str(e)}")
+        if output_file:
+            plt.savefig(output_file)
+            plt.close()
+        else:
+            plt.show()
+
+def analyze_audio_files(original_file, bit24_file, bit16_file, output_dir='subband_analysis'):
+    """
+    Analyze and compare original, 24-bit, and 16-bit audio files
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Initialize subband analyzer
+    analyzer = SubbandAnalysis(num_bands=32)
+    
+    # Load audio files
+    original, sr_orig = sf.read(original_file)
+    audio_24bit, sr_24 = sf.read(bit24_file)
+    audio_16bit, sr_16 = sf.read(bit16_file)
+    
+    # Ensure mono
+    if len(original.shape) > 1:
+        original = original.mean(axis=1)
+    if len(audio_24bit.shape) > 1:
+        audio_24bit = audio_24bit.mean(axis=1)
+    if len(audio_16bit.shape) > 1:
+        audio_16bit = audio_16bit.mean(axis=1)
+    
+    # Normalize
+    original = original / np.max(np.abs(original))
+    audio_24bit = audio_24bit / np.max(np.abs(audio_24bit))
+    audio_16bit = audio_16bit / np.max(np.abs(audio_16bit))
+    
+    # Perform subband analysis
+    print("Performing subband analysis...")
+    
+    subbands_orig = analyzer.analyze_subbands(original, sr_orig)
+    subbands_24bit = analyzer.analyze_subbands(audio_24bit, sr_24)
+    subbands_16bit = analyzer.analyze_subbands(audio_16bit, sr_16)
+    
+    # Compute subband energies
+    energies_orig = analyzer.compute_subband_energies(subbands_orig)
+    energies_24bit = analyzer.compute_subband_energies(subbands_24bit)
+    energies_16bit = analyzer.compute_subband_energies(subbands_16bit)
+    
+    # Plot results
+    print("Generating plots...")
+    
+    # Spectrum plots
+    analyzer.plot_subband_spectrum(subbands_orig, sr_orig, "Original",
+                                 os.path.join(output_dir, 'spectrum_original.png'))
+    analyzer.plot_subband_spectrum(subbands_24bit, sr_24, "24-bit",
+                                 os.path.join(output_dir, 'spectrum_24bit.png'))
+    analyzer.plot_subband_spectrum(subbands_16bit, sr_16, "16-bit",
+                                 os.path.join(output_dir, 'spectrum_16bit.png'))
+    
+    # Energy distribution plots
+    analyzer.plot_subband_energies(energies_orig, "Original",
+                                 os.path.join(output_dir, 'energy_original.png'))
+    analyzer.plot_subband_energies(energies_24bit, "24-bit",
+                                 os.path.join(output_dir, 'energy_24bit.png'))
+    analyzer.plot_subband_energies(energies_16bit, "16-bit",
+                                 os.path.join(output_dir, 'energy_16bit.png'))
+    
+    # Compute differences
+    energy_diff_24 = 10 * np.log10(np.abs(energies_orig - energies_24bit) + 1e-10)
+    energy_diff_16 = 10 * np.log10(np.abs(energies_orig - energies_16bit) + 1e-10)
+    
+    # Save numerical results
+    results = {
+        'sample_rate': sr_orig,
+        'num_subbands': analyzer.num_bands,
+        'subband_energies': {
+            'original': energies_orig.tolist(),
+            '24bit': energies_24bit.tolist(),
+            '16bit': energies_16bit.tolist()
+        },
+        'energy_differences': {
+            '24bit_vs_original': energy_diff_24.tolist(),
+            '16bit_vs_original': energy_diff_16.tolist()
+        }
+    }
+    
+    with open(os.path.join(output_dir, 'subband_analysis_results.json'), 'w') as f:
+        json.dump(results, f, indent=4)
+    
+    # Print summary statistics
+    print("\nAnalysis Results:")
+    print(f"Number of subbands: {analyzer.num_bands}")
+    print("\nEnergy Differences (dB):")
+    print(f"24-bit vs Original - Max: {np.max(energy_diff_24):.2f}, Mean: {np.mean(energy_diff_24):.2f}")
+    print(f"16-bit vs Original - Max: {np.max(energy_diff_16):.2f}, Mean: {np.mean(energy_diff_16):.2f}")
+    
+    return results
 
 if __name__ == "__main__":
-    main()
+    # Specify input files
+    original_file = "input_audio/input_audio.wav"
+    bit24_file = "quantization_results/24bit/output_24bit.wav"
+    bit16_file = "quantization_results/16bit/output_16bit.wav"
+    
+    try:
+        results = analyze_audio_files(original_file, bit24_file, bit16_file)
+        print("\nSubband analysis completed successfully!")
+    except FileNotFoundError as e:
+        print(f"Error: Could not find audio file - {str(e)}")
+    except Exception as e:
+        print(f"Error during analysis: {str(e)}")

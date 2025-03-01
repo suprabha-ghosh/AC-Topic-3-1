@@ -1,221 +1,263 @@
 import numpy as np
+from scipy import signal
+import soundfile as sf
+import matplotlib.pyplot as plt
+import os
+import json
+from scipy.optimize import fsolve
 
-class BitAllocation:
-    def __init__(self, target_bitrate):
+class SubbandBitAllocation:
+    def __init__(self, num_bands, target_bitrate):
         """
-        Initialize bit allocation with target bitrate and bit-depth specific parameters
+        Initialize subband bit allocation analyzer
         
         Args:
-            target_bitrate (int): Target bit depth (32, 24, or 16)
+            num_bands: Number of subbands (64, 128, or 512)
+            target_bitrate: Target bitrate in bits per sample
         """
+        self.num_bands = num_bands
         self.target_bitrate = target_bitrate
-        self.lambda_min = 1e-10
-        self.lambda_max = 100
-        
-        # Set quantization parameters based on target bit depth
-        if target_bitrate == 32:
-            self.max_bits_per_sample = 32
-            self.noise_floor = -192  # dB for 32-bit audio
-            self.dynamic_range = 192
-        elif target_bitrate == 24:
-            self.max_bits_per_sample = 24
-            self.noise_floor = -144  # dB for 24-bit audio
-            self.dynamic_range = 144
-        elif target_bitrate == 16:
-            self.max_bits_per_sample = 16
-            self.noise_floor = -96   # dB for 16-bit audio
-            self.dynamic_range = 96
-        else:
-            raise ValueError("Target bitrate must be 32, 24, or 16")
-        
-        self.min_bits_per_band = 2  # Minimum bits to allocate to any band
-        
-    def compute_subband_energies(self, subband_signals):
-        """
-        Compute energy in each subband
-        
-        Args:
-            subband_signals (np.ndarray): Subband decomposed signals
-            
-        Returns:
-            np.ndarray: Energy values for each subband
-        """
-        return np.mean(np.abs(subband_signals) ** 2, axis=1)
-    
-    def compute_perceptual_entropy(self, subband_energies, masking_threshold):
-        """
-        Compute perceptual entropy for each subband
-        
-        Args:
-            subband_energies (np.ndarray): Energy in each subband
-            masking_threshold (np.ndarray): Masking threshold for each subband
-            
-        Returns:
-            np.ndarray: Perceptual entropy values
-        """
-        signal_to_mask_ratio = 10 * np.log10(subband_energies / (masking_threshold + 1e-10))
-        pe = np.maximum(0, signal_to_mask_ratio) / 6.02  # 6.02 dB per bit
-        return pe
-    
-    def optimize_allocation(self, subband_energies, masking_threshold, frame_size):
-        """
-        Optimize bit allocation using Lagrange multiplier with bit depth constraints
-        
-        Args:
-            subband_energies (np.ndarray): Energy in each subband
-            masking_threshold (np.ndarray): Masking threshold for each subband
-            frame_size (int): Size of the audio frame
-            
-        Returns:
-            np.ndarray: Optimized bit allocation for each subband
-        """
-        # Calculate target total bits based on bit depth
-        target_bits = self.target_bitrate * frame_size
-        
-        # Compute perceptual entropy
-        pe = self.compute_perceptual_entropy(subband_energies, masking_threshold)
-        
-        def compute_bits(lambda_val):
-            """
-            Compute bit allocation for a given lambda value
-            """
-            # Perceptual weight based on masking threshold and dynamic range
-            perceptual_weight = 1 / (masking_threshold + 1e-10)
-            perceptual_weight *= (self.dynamic_range / 96.0)  # Scale based on bit depth
-            
-            # Basic bit allocation formula
-            bits = 0.5 * np.log2(subband_energies * perceptual_weight / lambda_val)
-            
-            # Apply perceptual entropy weighting
-            bits *= (pe / np.max(pe + 1e-10))
-            
-            # Scale bits based on target bit depth
-            bits *= (self.target_bitrate / 16.0)  # Scale relative to 16-bit
-            
-            # Apply bit depth constraints
-            bits = np.minimum(bits, self.max_bits_per_sample)
-            bits = np.maximum(bits, 0)
-            
-            # Ensure minimum bits for active bands
-            active_bands = bits > 0
-            bits[active_bands] = np.maximum(bits[active_bands], self.min_bits_per_band)
-            
-            return bits
-        
-        # Binary search for optimal lambda
-        lambda_min = self.lambda_min
-        lambda_max = self.lambda_max
-        best_bits = None
-        min_error = float('inf')
-        
-        for _ in range(100):
-            lambda_mid = (lambda_min + lambda_max) / 2
-            bits = compute_bits(lambda_mid)
-            total_bits = np.sum(bits)
-            
-            error = abs(total_bits - target_bits)
-            
-            if error < min_error:
-                min_error = error
-                best_bits = bits
-            
-            if abs(total_bits - target_bits) < 1e-6:
-                break
-            elif total_bits > target_bits:
-                lambda_min = lambda_mid
-            else:
-                lambda_max = lambda_mid
-        
-        return self.refine_bit_allocation(best_bits, subband_energies, masking_threshold)
+        self.prototype_filter = self.design_prototype_filter()
 
-    def refine_bit_allocation(self, initial_bits, subband_energies, masking_threshold):
-        """
-        Refine bit allocation to better match psychoacoustic criteria
-        
-        Args:
-            initial_bits (np.ndarray): Initial bit allocation
-            subband_energies (np.ndarray): Energy in each subband
-            masking_threshold (np.ndarray): Masking threshold for each subband
-            
-        Returns:
-            np.ndarray: Refined bit allocation
-        """
-        bits = initial_bits.copy()
-        
-        # Calculate SNR for each band
-        snr = 10 * np.log10(subband_energies / (masking_threshold + 1e-10))
-        
-        # Scale SNR based on bit depth
-        snr *= (self.target_bitrate / 16.0)
-        
-        # Normalize SNR
-        snr_normalized = (snr - np.min(snr)) / (np.max(snr) - np.min(snr) + 1e-10)
-        
-        # Adjust bits based on SNR
-        active_bands = bits > 0
-        if np.any(active_bands):
-            # Redistribute bits from less perceptually important bands
-            total_adjustment = np.sum(snr_normalized[active_bands] * 0.1)
-            bits[active_bands] += snr_normalized[active_bands] * total_adjustment
-            
-            # Scale adjustment based on bit depth
-            bits *= (self.target_bitrate / 16.0)
-            
-            # Ensure we don't exceed maximum bits per sample
-            bits = np.minimum(bits, self.max_bits_per_sample)
-            
-            # Round to nearest integer
-            bits = np.round(bits)
-        
-        return bits
+    def design_prototype_filter(self):
+        """Design prototype filter for subband analysis"""
+        M = self.num_bands * 16  # Filter length proportional to number of subbands
+        cutoff = 1.0 / (2.0 * self.num_bands)
+        return signal.firwin(M, cutoff)
 
-    def verify_allocation(self, bit_allocation, frame_size):
-        """
-        Verify that bit allocation meets constraints
+    def analyze_subbands(self, audio_data):
+        """Decompose signal into subbands"""
+        subbands = np.zeros((self.num_bands, len(audio_data)))
         
-        Args:
-            bit_allocation (np.ndarray): Bit allocation array
-            frame_size (int): Size of the audio frame
-            
-        Returns:
-            bool: True if allocation is valid, False otherwise
-        """
-        total_bits = np.sum(bit_allocation)
-        target_bits = self.target_bitrate * frame_size
+        for k in range(self.num_bands):
+            band_filter = self.prototype_filter * np.cos(
+                np.pi/(2*self.num_bands) * (2*k + 1) * 
+                np.arange(len(self.prototype_filter))
+            )
+            subbands[k] = signal.lfilter(band_filter, 1.0, audio_data)
         
-        # Allow margin based on bit depth
-        margin = 1.1 + (self.target_bitrate - 16) * 0.01
-        
-        if total_bits > target_bits * margin:
-            return False
-        
-        if np.any(bit_allocation > self.max_bits_per_sample):
-            return False
-        
-        if np.any(np.logical_and(bit_allocation > 0, 
-                                bit_allocation < self.min_bits_per_band)):
-            return False
-        
-        return True
+        return subbands
 
-    def calculate_allocation_statistics(self, bit_allocation):
+    def compute_subband_variances(self, subbands):
+        """Compute variance in each subband"""
+        return np.var(subbands, axis=1)
+
+    def lagrange_bit_allocation(self, variances):
         """
-        Calculate statistics about the bit allocation
+        Implement Lagrange multiplier method for optimal bit allocation
+        """
+        def bit_constraint(lambda_val):
+            bits = 0.5 * np.log2(variances / lambda_val)
+            bits = np.maximum(bits, 0)  # No negative bits
+            return np.sum(bits) - self.target_bitrate * self.num_bands
+
+        # Find optimal Lagrange multiplier
+        lambda_init = np.mean(variances) / (2 ** (2 * self.target_bitrate))
+        lambda_opt = fsolve(bit_constraint, lambda_init)[0]
+
+        # Compute final bit allocation
+        bits = 0.5 * np.log2(variances / lambda_opt)
+        return np.maximum(bits, 0)
+
+    def analyze_and_allocate(self, audio_data, sample_rate, label):
+        """
+        Perform complete analysis and bit allocation for one audio version
+        """
+        # Perform subband analysis
+        subbands = self.analyze_subbands(audio_data)
         
-        Args:
-            bit_allocation (np.ndarray): Bit allocation array
-            
-        Returns:
-            dict: Statistics about the bit allocation
-        """
-        stats = {
-            'total_bits': np.sum(bit_allocation),
-            'max_bits': np.max(bit_allocation),
-            'min_bits': np.min(bit_allocation[bit_allocation > 0]),
-            'mean_bits': np.mean(bit_allocation[bit_allocation > 0]),
-            'active_bands': np.sum(bit_allocation > 0),
-            'bit_depth': self.target_bitrate,
-            'dynamic_range': self.dynamic_range,
-            'theoretical_snr': 6.02 * self.target_bitrate + 1.76  # Theoretical SNR
+        # Compute subband variances
+        variances = self.compute_subband_variances(subbands)
+        
+        # Perform bit allocation
+        allocated_bits = self.lagrange_bit_allocation(variances)
+        
+        # Calculate SNR per subband
+        snr_per_band = 6.02 * allocated_bits + 1.76  # Theoretical SNR formula
+        
+        return {
+            'label': label,
+            'variances': variances,
+            'allocated_bits': allocated_bits,
+            'snr_per_band': snr_per_band,
+            'avg_bits': np.mean(allocated_bits),
+            'max_bits': np.max(allocated_bits),
+            'min_bits': np.min(allocated_bits),
+            'std_bits': np.std(allocated_bits)
         }
-        return stats
+
+    def plot_comparison(self, results, output_dir):
+        """
+        Plot comparison of different audio versions
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Plot 1: Subband Variances
+        plt.figure(figsize=(12, 6))
+        for result in results:
+            plt.semilogy(range(self.num_bands), result['variances'], 
+                        label=result['label'])
+        plt.grid(True)
+        plt.xlabel('Subband Index')
+        plt.ylabel('Variance')
+        plt.title(f'Subband Signal Variances ({self.num_bands} bands)')
+        plt.legend()
+        plt.savefig(os.path.join(output_dir, f'variances_{self.num_bands}bands.png'))
+        plt.close()
+        
+        # Plot 2: Bit Allocation
+        plt.figure(figsize=(12, 6))
+        for result in results:
+            plt.plot(range(self.num_bands), result['allocated_bits'], 
+                    label=result['label'])
+        plt.grid(True)
+        plt.xlabel('Subband Index')
+        plt.ylabel('Allocated Bits')
+        plt.title(f'Bit Allocation across Subbands ({self.num_bands} bands)')
+        plt.legend()
+        plt.savefig(os.path.join(output_dir, f'bit_allocation_{self.num_bands}bands.png'))
+        plt.close()
+        
+        # Plot 3: SNR per Subband
+        plt.figure(figsize=(12, 6))
+        for result in results:
+            plt.plot(range(self.num_bands), result['snr_per_band'], 
+                    label=result['label'])
+        plt.grid(True)
+        plt.xlabel('Subband Index')
+        plt.ylabel('SNR (dB)')
+        plt.title(f'Theoretical SNR per Subband ({self.num_bands} bands)')
+        plt.legend()
+        plt.savefig(os.path.join(output_dir, f'snr_{self.num_bands}bands.png'))
+        plt.close()
+
+def analyze_multiple_configurations(input_file, bit24_file, bit16_file, target_bitrate=16):
+    """
+    Analyze audio with different subband configurations and bit depths
+    """
+    # Subband configurations to test
+    configurations = [64, 128, 512]
+    
+    # Load audio files
+    input_audio, sr_input = sf.read(input_file)
+    audio_24bit, sr_24 = sf.read(bit24_file)
+    audio_16bit, sr_16 = sf.read(bit16_file)
+    
+    # Ensure mono
+    if len(input_audio.shape) > 1:
+        input_audio = input_audio.mean(axis=1)
+    if len(audio_24bit.shape) > 1:
+        audio_24bit = audio_24bit.mean(axis=1)
+    if len(audio_16bit.shape) > 1:
+        audio_16bit = audio_16bit.mean(axis=1)
+    
+    # Normalize
+    input_audio = input_audio / np.max(np.abs(input_audio))
+    audio_24bit = audio_24bit / np.max(np.abs(audio_24bit))
+    audio_16bit = audio_16bit / np.max(np.abs(audio_16bit))
+    
+    results = {}
+    
+    for num_bands in configurations:
+        print(f"\nAnalyzing {num_bands} subbands configuration...")
+        
+        # Create analyzer
+        analyzer = SubbandBitAllocation(num_bands, target_bitrate)
+        
+        # Create output directory
+        output_dir = f'bit_allocation_{num_bands}'
+        os.makedirs(output_dir, exist_ok=True)
+        
+        try:
+            # Analyze all versions
+            results_original = analyzer.analyze_and_allocate(
+                input_audio, sr_input, "Original")
+            results_24bit = analyzer.analyze_and_allocate(
+                audio_24bit, sr_24, "24-bit")
+            results_16bit = analyzer.analyze_and_allocate(
+                audio_16bit, sr_16, "16-bit")
+            
+            # Convert numpy arrays to lists for JSON serialization
+            for results_dict in [results_original, results_24bit, results_16bit]:
+                results_dict['variances'] = results_dict['variances'].tolist()
+                results_dict['allocated_bits'] = results_dict['allocated_bits'].tolist()
+                results_dict['snr_per_band'] = results_dict['snr_per_band'].tolist()
+                results_dict['avg_bits'] = float(results_dict['avg_bits'])
+                results_dict['max_bits'] = float(results_dict['max_bits'])
+                results_dict['min_bits'] = float(results_dict['min_bits'])
+                results_dict['std_bits'] = float(results_dict['std_bits'])
+            
+            # Plot comparisons
+            analyzer.plot_comparison(
+                [results_original, results_24bit, results_16bit],
+                output_dir
+            )
+            
+            # Store results
+            results[num_bands] = {
+                'original': results_original,
+                '24bit': results_24bit,
+                '16bit': results_16bit
+            }
+            
+            # Save numerical results
+            with open(os.path.join(output_dir, 'allocation_results.json'), 'w') as f:
+                json.dump(results[num_bands], f, indent=4)
+            
+            # Print summary statistics
+            print(f"\nConfiguration: {num_bands} subbands")
+            for version in [results_original, results_24bit, results_16bit]:
+                print(f"\n{version['label']}:")
+                print(f"Average bits per subband: {version['avg_bits']:.2f}")
+                print(f"Max bits allocated: {version['max_bits']:.2f}")
+                print(f"Min bits allocated: {version['min_bits']:.2f}")
+                print(f"Standard deviation: {version['std_bits']:.2f}")
+            
+        except Exception as e:
+            print(f"Error analyzing {num_bands} subbands: {str(e)}")
+            raise  # Add this to see the full error traceback
+    
+    return results
+
+def compare_configurations(results):
+    """
+    Compare results across different subband configurations
+    """
+    plt.figure(figsize=(15, 8))
+    
+    # Plot bit allocation for each configuration and version
+    for num_bands, result in results.items():
+        for version in ['original', '24bit', '16bit']:
+            allocated_bits = np.array(result[version]['allocated_bits'])  # Convert back to numpy array
+            plt.plot(np.linspace(0, 1, len(allocated_bits)), 
+                    allocated_bits, 
+                    label=f'{num_bands} bands - {version}')
+    
+    plt.grid(True)
+    plt.xlabel('Normalized Frequency')
+    plt.ylabel('Allocated Bits')
+    plt.title('Bit Allocation Comparison Across Configurations and Bit Depths')
+    plt.legend()
+    plt.savefig('subband_comparison_all.png')
+    plt.close()
+
+
+if __name__ == "__main__":
+    # Specify input files
+    input_file = "input_audio/input_audio.wav"
+    bit24_file = "quantization_results/24bit/output_24bit.wav"
+    bit16_file = "quantization_results/16bit/output_16bit.wav"
+    
+    try:
+        # Analyze all configurations
+        results = analyze_multiple_configurations(input_file, bit24_file, bit16_file)
+        
+        # Compare configurations
+        compare_configurations(results)
+        
+        print("\nAnalysis completed successfully!")
+        
+    except FileNotFoundError as e:
+        print(f"Error: Could not find audio file - {str(e)}")
+    except Exception as e:
+        print(f"Error during analysis: {str(e)}")
